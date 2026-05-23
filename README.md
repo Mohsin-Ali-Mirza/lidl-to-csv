@@ -118,3 +118,7 @@ If you want to run the entire stack locally for testing:
    python main.py
    ```
    The backend will start running at `http://127.0.0.1:8000`.
+
+
+### Contributors
+- **[Muhammad Waleed Gul](https://github.com/waleedgul92)**
