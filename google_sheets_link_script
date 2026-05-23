@@ -1,0 +1,272 @@
+// ----------------- CORS Preflight -----------------
+function doOptions(e) {
+  return ContentService.createTextOutput()
+    .setHeaders({
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type'
+    });
+}
+
+// ----------------- Main GET Handler -----------------
+function doGet(e) {
+  const action = e.parameter.action;
+  const callback = e.parameter.callback; // optional JSONP callback name
+  let responseData;
+
+  try {
+    if (action === 'getExpenses') {
+      responseData = getExpenses();
+    } else if (action === 'getSummary' || action === 'fetchSummary') { // Accept fetchSummary too
+      const month = e.parameter.month;
+      const year = e.parameter.year;
+      responseData = getSummary(month, year);
+    } else {
+      responseData = { error: 'Invalid action for GET request: ' + action };
+    }
+  } catch (err) {
+    responseData = { error: 'Script failed: ' + err.message };
+  }
+
+  if (callback) {
+    const jsonp = callback + '(' + JSON.stringify(responseData) + ');';
+    return ContentService.createTextOutput(jsonp)
+      .setMimeType(ContentService.MimeType.JAVASCRIPT);
+  } else {
+    return ContentService.createTextOutput(JSON.stringify(responseData))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+// ----------------- Main POST Handler -----------------
+function doPost(e) {
+  const action = e.parameter.action;
+  let requestBody;
+
+  try {
+    requestBody = JSON.parse(e.postData.contents);
+  } catch (err) {
+    return ContentService.createTextOutput(
+      JSON.stringify({ error: 'Invalid JSON in request body: ' + err.message })
+    ).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  let responseData;
+  try {
+    if (action === 'addExpense') {
+      responseData = addExpense(requestBody);
+    } else if (action === 'addBatchExpenses') {
+      responseData = addBatchExpenses(requestBody.items || []);
+    } else if (action === 'updateExpense') { // <-- This block is crucial
+      responseData = updateExpense(requestBody);
+    } else {
+      responseData = { error: 'Invalid action for POST request: ' + action };
+    }
+  } catch (err) {
+    Logger.log('Script Error: ' + err.message); // Log the error
+    responseData = { error: 'Script failed: ' + err.message };
+  }
+
+  return ContentService.createTextOutput(JSON.stringify(responseData))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ----------------- Helpers -----------------
+
+// Column Headers
+const HEADERS = ['Item', 'Cost', 'Person Responsible', 'Date', 'Quantity'];
+
+// Flexible date parser supporting DD/MM/YYYY and YYYY-MM-DD
+function parseDateFlexible(str) {
+  if (!str) return null;
+
+  // Try DD/MM/YYYY
+  const dmy = str.split('/');
+  if (dmy.length === 3) {
+    const day = parseInt(dmy[0], 10);
+    const month = parseInt(dmy[1], 10) - 1;
+    const year = parseInt(dmy[2], 10);
+    const date = new Date(year, month, day);
+    if (!isNaN(date.getTime())) return date;
+  }
+
+  // Try YYYY-MM-DD
+  const ymd = str.split('-');
+  if (ymd.length === 3) {
+    const year = parseInt(ymd[0], 10);
+    const month = parseInt(ymd[1], 10) - 1;
+    const day = parseInt(ymd[2], 10);
+    const date = new Date(year, month, day);
+    if (!isNaN(date.getTime())) return date;
+  }
+  
+  // Try ISO Date object string
+  try {
+    const isoDate = new Date(str);
+    if (!isNaN(isoDate.getTime())) return isoDate;
+  } catch (e) {
+    // not an ISO string, ignore
+  }
+
+  return null; // failed to parse
+}
+
+// Get all expenses
+function getExpenses() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Expenses');
+  if (!sheet) return { error: 'Sheet "Expenses" not found' };
+
+  const data = sheet.getDataRange().getValues();
+  const expenses = [];
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    if (row[0]) { // Check if first cell (Item) is not empty
+      try {
+        const expenseDate = parseDateFlexible(row[3]);
+        if (!expenseDate) throw new Error('Invalid date: ' + row[3]);
+
+        expenses.push({
+          id: 'row-' + (i + 1), // Row number is index + 1
+          item: row[0],
+          cost: parseFloat(row[1]),
+          person: row[2],
+          date: expenseDate.toISOString().split('T')[0], // Format as YYYY-MM-DD
+          quantity: parseInt(row[4], 10) || 1 // <-- ADDED QUANTITY
+        });
+      } catch (e) {
+        console.error('Skipping row ' + (i + 1) + ': ' + e.message);
+        Logger.log('Skipping row ' + (i + 1) + ': ' + e.message);
+      }
+    }
+  }
+
+  return { expenses: expenses.reverse() }; // Show newest first
+}
+
+// Add a single expense
+function addExpense(expenseData) {
+  let sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Expenses');
+  if (!sheet) {
+    sheet = SpreadsheetApp.getActiveSpreadsheet().insertSheet('Expenses');
+    sheet.appendRow(HEADERS); // <-- Use 5-column headers
+  }
+
+  // Data is expected in DD/MM/YYYY format from geminiService.ts
+  sheet.appendRow([
+    expenseData.item, 
+    expenseData.cost, 
+    expenseData.person, 
+    expenseData.date, 
+    expenseData.quantity || 1 // <-- ADDED QUANTITY
+  ]);
+  const newId = 'row-' + sheet.getLastRow();
+  
+  // Return the new expense with the ID
+  return { success: true, newExpense: Object.assign({}, expenseData, { id: newId }) };
+}
+
+// Add multiple expenses
+function addBatchExpenses(items) {
+  let sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Expenses');
+  if (!sheet) {
+    sheet = SpreadsheetApp.getActiveSpreadsheet().insertSheet('Expenses');
+    sheet.appendRow(HEADERS); // <-- Use 5-column headers
+  }
+
+  items.forEach(item => {
+    // Data is expected in DD/MM/YYYY format
+    sheet.appendRow([
+      item.item, 
+      item.cost, 
+      item.person, 
+      item.date, 
+      item.quantity || 1 // <-- ADDED QUANTITY
+    ]);
+  });
+
+  return { success: true };
+}
+
+// Get summary for a given month/year
+function getSummary(month, year) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Expenses');
+  if (!sheet) return { error: 'Sheet "Expenses" not found' };
+
+  const data = sheet.getDataRange().getValues();
+  const summary = {};
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    if (row[3] && row[1]) { // Check if date and cost exist
+      try {
+        const expenseDate = parseDateFlexible(row[3]);
+        if (!expenseDate) continue; // Skip if date is invalid
+
+        const expenseMonth = expenseDate.getMonth() + 1;
+        const expenseYear = expenseDate.getFullYear();
+
+        if (expenseMonth === parseInt(month, 10) && expenseYear === parseInt(year, 10)) {
+          const person = row[2];
+          const cost = parseFloat(row[1]);
+          if (!summary[person]) summary[person] = 0;
+          if (!isNaN(cost)) summary[person] += cost;
+        }
+      } catch (e) {
+         console.error('Error in row ' + (i + 1) + ': ' + e.message);
+        Logger.log('Error in summary row ' + (i + 1) + ': ' + e.message);
+      }
+    }
+  }
+
+  return { summary: summary };
+}
+
+
+// --- NEW FUNCTION ---
+// Update an existing expense
+function updateExpense(expenseData) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Expenses');
+  if (!sheet) {
+    return { error: 'Sheet "Expenses" not found' };
+  }
+
+  // Your getExpenses() function creates IDs like "row-5"
+  // We need to parse the row number from this ID
+  const id = expenseData.id;
+  if (!id || !id.startsWith('row-')) {
+    return { error: 'Invalid or missing expense ID' };
+  }
+
+  const rowNumber = parseInt(id.split('-')[1], 10);
+  if (isNaN(rowNumber) || rowNumber <= 1) { // <= 1 because row 1 is headers
+    return { error: 'Could not parse row number from ID: ' + id };
+  }
+  
+  // Create the new row data in the correct column order
+  // expenseData.date is already formatted as DD/MM/YYYY by geminiService.ts
+  const newRowData = [
+    expenseData.item,
+    expenseData.cost,
+    expenseData.person,
+    expenseData.date,
+    expenseData.quantity || 1 // <-- ADDED QUANTITY
+  ];
+  
+  try {
+    // Get the range for the specific row (5 columns wide)
+    // getRange(row, column, numRows, numColumns)
+    const range = sheet.getRange(rowNumber, 1, 1, 5); // <-- CHANGED 4 to 5
+    
+    // Set the new values (must be a 2D array)
+    range.setValues([newRowData]); 
+    
+    // Return success
+    return { success: true, updatedExpense: expenseData };
+
+  } catch (err) {
+    Logger.log('Error updating row ' + rowNumber + ': ' + err.message);
+    return { error: 'Failed to update sheet: ' + err.message };
+  }
+}
+

@@ -1,0 +1,3 @@
+# Exclude backend and script files from Vercel deployment
+Gemini/
+google_sheets_link_script
